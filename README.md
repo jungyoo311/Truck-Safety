@@ -11,6 +11,10 @@ TPD system
 ```mardown
 source setup_env.sh
 ```
+```mardown
+sudo apt install hailo-tappas-core=3.30.0-1 hailo-dkms=4.19.0-1 hailort=4.19.0-3
+```
+
 2. Requirment Installation
     Under the activated virtual environment, install the necessary Python requirement packages.
 ```markdown
