@@ -3,7 +3,10 @@ TPD system
 2024-25 SDP Truck Safety TPD system
 1. Forward Collision Warning
 2. Lane Merge Warning
- 
+
+## Important Notes
+Code structure needs to be strictly follow 'hailo-apps-infra', which is hailo pipelines.
+Make sure you install all dependencies followed by the instructions. 
 ## Instructions to set-up the environment
 ## Installation
 1. Environmental Configuration
