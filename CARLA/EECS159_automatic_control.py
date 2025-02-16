@@ -30,6 +30,9 @@ yolo_model = YOLO("E:\\SeniorDesignProject\\models\\yolov10s.pt")
 import json
 import cv2
 
+#------------ danger zone ---------
+from EECS159_scripts import compute_danger_zone, draw_danger_zone, is_intersecting, draw_danger_zone_pygame
+
 
 os.makedirs('E:/SeniorDesignProject/CARLA/output/camera_images', exist_ok=True)
 os.makedirs('E:/SeniorDesignProject/CARLA/output/lidar_data', exist_ok=True)
@@ -179,7 +182,9 @@ class World(object):
         blueprint_list = get_actor_blueprints(self.world, self._actor_filter, self._actor_generation)
         if not blueprint_list:
             raise ValueError("Couldn't find any blueprints with the specified filters")
-        blueprint = random.choice(blueprint_list)
+        # blueprint = random.choice(blueprint_list)
+        blueprint_library = self.world.get_blueprint_library()
+        blueprint = blueprint_library.find('vehicle.carlamotors.firetruck')
         blueprint.set_attribute('role_name', 'hero')
         if blueprint.has_attribute('color'):
             color = random.choice(blueprint.get_attribute('color').recommended_values)
@@ -239,6 +244,8 @@ class World(object):
     def tick(self, clock):
         """Method for every tick"""
         self.hud.tick(self, clock)
+        # Draw the danger zone
+        self.draw_danger_zone()
         
         # Record speed and acceleration ------------------------------------------------------------
          # Update metadata on the first tick
@@ -272,6 +279,47 @@ class World(object):
 
             self.last_log_time = current_time
         # Record speed and acceleration ------------------------------------------------------------
+        
+    def draw_danger_zone(self):
+        # Compute vehicle's speed in m/s
+        velocity = self.player.get_velocity()
+        speed_m_s = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+
+        # Calculate danger zone length
+        danger_zone_length = 5.4 * speed_m_s  # Length in meters
+
+        # Get vehicle's transform and orientation vectors
+        transform = self.player.get_transform()
+        forward_vector = transform.get_forward_vector()
+        right_vector = transform.get_right_vector()
+
+        # Vehicle dimensions
+        bounding_box = self.player.bounding_box
+        vehicle_width = bounding_box.extent.y * 2  # Width in meters
+        half_width = vehicle_width / 2
+
+        # Compute the start location at the front of the vehicle
+        start_location = transform.location + forward_vector * bounding_box.extent.x
+
+        # Compute the corners of the danger zone rectangle
+        corner1 = start_location + right_vector * half_width
+        corner2 = start_location - right_vector * half_width
+        end_location = start_location + forward_vector * danger_zone_length
+        corner3 = end_location - right_vector * half_width
+        corner4 = end_location + right_vector * half_width
+
+        # Draw the danger zone
+        debug = self.world.debug
+        color = carla.Color(r=255, g=0, b=0)  # Red color
+
+        # Use fixed_delta_seconds as life_time
+        fixed_delta_seconds = self.world.get_settings().fixed_delta_seconds or 0.05
+
+        # Draw lines between the corners
+        debug.draw_line(corner1, corner2, thickness=0.1, color=color, life_time=fixed_delta_seconds)
+        debug.draw_line(corner2, corner3, thickness=0.1, color=color, life_time=fixed_delta_seconds)
+        debug.draw_line(corner3, corner4, thickness=0.1, color=color, life_time=fixed_delta_seconds)
+        debug.draw_line(corner4, corner1, thickness=0.1, color=color, life_time=fixed_delta_seconds)
 
     def render(self, display):
         """Render world"""
@@ -795,32 +843,76 @@ class CameraManager(object):
             image.convert(cc.Raw)  # Ensure the image is in raw RGB format
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
             array = np.reshape(array, (image.height, image.width, 4))[:, :, :3]  # Drop alpha channel (RGBA -> RGB)
-            array = array[:, :, ::-1]
+            array = array[:, :, ::-1]       # NECESSARY for color correction
             
             # Run YOLO on the frame
             results = yolo_model(array)
             
             # Draw YOLO detections on the image
-            annotated_frame = results[0].plot()  # Results include bounding boxes, confidences, etc.
-            
+            annotated_frame = results[0].plot()  # Results include bounding boxes, confidences, etc.         
+                    
             # Log detections
             detections = []
+            boxes = []
             for box in results[0].boxes:
+                bbox = box.xyxy.numpy().flatten()
+                cls = int(box.cls)
+                conf = float(box.conf)
                 detections.append({
                     "class": yolo_model.names[int(box.cls)],  # Class name
                     "confidence": round(float(box.conf), 3),  # Confidence score
                     "bbox": [round(float(coord), 2) for coord in box.xyxy.numpy().flatten()]  # Bounding box
                 })
+                boxes.append({
+                    "bbox": bbox,
+                    "class": cls,
+                    "confidence": conf
+                })
                 
+            # Compute danger zone corners in world coordinates
+            danger_zone_world = self.compute_danger_zone_corners()
+
+            # Project danger zone into image coordinates
+            camera_matrix = self.get_camera_matrix(image)
+            camera_points = self.world_to_camera(danger_zone_world, self.sensor)
+            if camera_points.shape[1] == 0:
+                # All points are behind the camera
+                danger_zone_image_points = []
+            else:
+                danger_zone_image_points = self.camera_to_image(camera_points, camera_matrix)
+                # Ensure we have exactly four points
+                if len(danger_zone_image_points) != 4:
+                    danger_zone_image_points = []
+
+            # Copy the original image
+            annotated_frame = array.copy()
+
+            # Draw danger zone on the image if available
+            if danger_zone_image_points:
+                annotated_frame = self.draw_danger_zone_on_image(annotated_frame, danger_zone_image_points)
+
+            # Check for overlaps between bounding boxes and danger zone
+            overlapping_indices = set()
+            if danger_zone_image_points:
+                danger_zone_polygon = np.array(danger_zone_image_points, dtype=np.int32)
+                for idx, box in enumerate(boxes):
+                    bbox = box['bbox']
+                    if self.check_bbox_overlap_with_danger_zone(bbox, danger_zone_polygon):
+                        overlapping_indices.add(idx)
+
+            # Draw bounding boxes
+            self.draw_bounding_boxes(annotated_frame, boxes, overlapping_indices)
+            
+            # Convert annotated frame back for display in pygame
+            self.surface = pygame.surfarray.make_surface(annotated_frame.swapaxes(0, 1))
+            
             # Save detections for the current frame
             self.detections.append({
                 "frame": image.frame,
                 "time": round(self.hud.simulation_time, 3),
                 "detections": detections
             })
-
-            # Convert annotated frame back for display in pygame
-            self.surface = pygame.surfarray.make_surface(annotated_frame.swapaxes(0, 1))
+            
         if self.recording and self.video_writer:
             self.video_writer.write(cv2.cvtColor(annotated_frame, cv2.COLOR_RGB2BGR))
         
@@ -834,6 +926,140 @@ class CameraManager(object):
         #         image.save_to_disk('E:/SeniorDesignProject/CARLA/output/camera_images/%08d' % image.frame)
         #     self.frame_count+=1
 
+    def compute_danger_zone_corners(self):
+        # Compute vehicle's speed in m/s
+        velocity = self._parent.get_velocity()
+        speed_m_s = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+
+        # Calculate danger zone length
+        danger_zone_length = 5.4 * speed_m_s  # Length in meters
+
+        # Get vehicle's transform and orientation vectors
+        transform = self._parent.get_transform()
+        forward_vector = transform.get_forward_vector()
+        right_vector = transform.get_right_vector()
+
+        # Vehicle dimensions
+        bounding_box = self._parent.bounding_box
+        vehicle_width = bounding_box.extent.y * 2  # Width in meters
+        half_width = vehicle_width / 2
+
+        # Compute the start location at the front of the vehicle
+        start_location = transform.location + forward_vector * bounding_box.extent.x
+
+        # Compute the corners of the danger zone rectangle
+        corner1 = start_location + right_vector * half_width
+        corner2 = start_location - right_vector * half_width
+        end_location = start_location + forward_vector * danger_zone_length
+        corner3 = end_location - right_vector * half_width
+        corner4 = end_location + right_vector * half_width
+
+        return [corner1, corner2, corner3, corner4]
+    
+    def get_camera_matrix(self, image):
+        # Get camera intrinsic parameters
+        image_width = image.width
+        image_height = image.height
+        fov = self.sensor.attributes['fov']
+        focal_length = image_width / (2 * math.tan(float(fov) * math.pi / 360))
+
+        # Build the camera intrinsic matrix
+        camera_matrix = np.array([
+            [focal_length, 0, image_width / 2],
+            [0, focal_length, image_height / 2],
+            [0, 0, 1]
+        ])
+
+        return camera_matrix
+    
+    def world_to_camera(self, world_points, sensor):
+        # Get the sensor transform
+        sensor_transform = sensor.get_transform()
+        sensor_world_matrix = sensor_transform.get_matrix()
+        world_2_sensor = np.linalg.inv(np.array(sensor_world_matrix))
+
+        # Convert points to homogeneous coordinates
+        world_points_homogeneous = np.array([[point.x, point.y, point.z, 1.0] for point in world_points]).T
+
+        # Transform points from world to sensor coordinates
+        sensor_points = np.dot(world_2_sensor, world_points_homogeneous)
+
+        # Keep only points in front of the camera
+        sensor_points = sensor_points[:, sensor_points[2, :] > 0]
+
+        return sensor_points
+    
+    def camera_to_image(self, camera_points, camera_matrix):
+        # Project 3D camera coordinates into 2D image plane
+        camera_points = camera_points[:3, :]
+        image_points = np.dot(camera_matrix, camera_points)
+
+        # Normalize by the third (z) coordinate
+        image_points = image_points / image_points[2, :]
+
+        # Return the 2D image points
+        return image_points[:2, :].T  # Transpose to get a list of (x, y) tuples
+
+    def draw_danger_zone_on_image(self, image_array, danger_zone_image_points):
+        # Convert the image to BGR format for OpenCV if necessary
+        if image_array.shape[2] == 3:  # If RGB, convert to BGR
+            image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+        else:
+            image_bgr = image_array.copy()
+
+        # Convert the image points to integer pixel coordinates
+        danger_zone_polygon = np.array(danger_zone_image_points, dtype=np.int32)
+
+        # Draw the danger zone polygon on the image
+        cv2.polylines(image_bgr, [danger_zone_polygon], isClosed=True, color=(0, 0, 255), thickness=2)
+
+        # Convert back to RGB if necessary
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        return image_rgb
+    
+    def check_bbox_overlap_with_danger_zone(self, bbox, danger_zone_polygon):
+        # bbox is [x1, y1, x2, y2]
+        # Convert bbox to polygon
+        bbox_polygon = np.array([
+            [bbox[0], bbox[1]],
+            [bbox[2], bbox[1]],
+            [bbox[2], bbox[3]],
+            [bbox[0], bbox[3]]
+        ], dtype=np.int32)
+
+        # Use cv2 to check for overlap
+        retval, _ = cv2.intersectConvexConvex(bbox_polygon.astype(np.float32), danger_zone_polygon.astype(np.float32))
+
+        return retval > 0  # retval is the intersection area
+    
+    def draw_bounding_boxes(self, annotated_frame, boxes, overlapping_indices):
+        # Define colors
+        normal_color = (0, 255, 0)        # Green for non-overlapping boxes
+        danger_color = (0, 0, 255)        # Red for boxes overlapping with danger zone
+
+        # Draw bounding boxes
+        for idx, box in enumerate(boxes):
+            x1, y1, x2, y2 = map(int, box['bbox'])
+            cls = box['class']
+            conf = box['confidence']
+            label = f"{yolo_model.names[cls]} {conf:.2f}"
+
+            # Choose color based on overlap
+            if idx in overlapping_indices:
+                color = danger_color
+            else:
+                color = normal_color
+
+            # Draw rectangle
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+
+            # Draw label background
+            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(annotated_frame, (x1, y1 - text_height - baseline), (x1 + text_width, y1), color, -1)
+
+            # Put label text
+            cv2.putText(annotated_frame, label, (x1, y1 - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 # ==============================================================================
 # -- Game Loop ---------------------------------------------------------
 # ==============================================================================

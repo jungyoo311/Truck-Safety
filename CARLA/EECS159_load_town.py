@@ -28,5 +28,6 @@ def load_town_and_set_camera(town_name):
 
 if __name__ == "__main__":
     # Specify the town name you want to load
+    # towns I use: 04, 12
     town_name = 'Town04'  # Example: Town01, Town02, Town03, etc.
     load_town_and_set_camera(town_name)

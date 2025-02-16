@@ -1,0 +1,61 @@
+import carla
+import pygame
+import numpy as np
+
+# Initialize CARLA client
+client = carla.Client('localhost', 2000)
+client.set_timeout(10.0)
+world = client.get_world()
+
+# Get blueprint library
+blueprint_library = world.get_blueprint_library()
+
+# Spawn Tesla (Ego Vehicle)
+tesla_bp = blueprint_library.find('vehicle.tesla.model3')
+tesla_spawn = carla.Transform(carla.Location(x=-9.91, y=-217.00, z=0.2), carla.Rotation(yaw=90))
+tesla = world.try_spawn_actor(tesla_bp, tesla_spawn)
+
+# Spawn Firetruck
+firetruck_bp = blueprint_library.find("vehicle.carlamotors.firetruck")  # Use the correct firetruck blueprint
+firetruck_spawn = carla.Transform(carla.Location(x=-9.63, y=-203.82, z=0.2), carla.Rotation(yaw=90))
+firetruck = world.try_spawn_actor(firetruck_bp, firetruck_spawn)
+
+# Attach a camera to the front of the firetruck
+camera_bp = blueprint_library.find('sensor.camera.rgb')
+camera_bp.set_attribute('image_size_x', '800')
+camera_bp.set_attribute('image_size_y', '600')
+camera_bp.set_attribute('fov', '110')
+
+camera_transform = carla.Transform(carla.Location(x=2.5, z=2.0))  # Position at front of firetruck
+camera = world.spawn_actor(camera_bp, camera_transform, attach_to=firetruck)
+
+# Set up pygame for the display
+pygame.init()
+screen = pygame.display.set_mode((800, 600))
+
+def process_image(image):
+    """ Convert CARLA camera image to pygame format and display. """
+    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+    array = array.reshape((image.height, image.width, 4))  # BGRA format
+    array = array[:, :, :3]  # Remove alpha
+    array = array[:, :, ::-1]  # Convert to RGB
+
+    surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+    screen.blit(surface, (0, 0))
+    pygame.display.flip()
+
+# Start streaming the camera feed
+camera.listen(lambda image: process_image(image))
+
+# Run simulation loop
+try:
+    while True:
+        world.tick()
+except KeyboardInterrupt:
+    print("Stopping...")
+finally:
+    camera.stop()
+    camera.destroy()
+    firetruck.destroy()
+    tesla.destroy()
+    pygame.quit()
