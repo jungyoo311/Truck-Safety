@@ -264,18 +264,7 @@ def define_danger_zone(frame):
 def is_inside_polygon(point, polygon):
     return cv2.pointPolygonTest(polygon, point, False) >= 0
 
-def app_callback_fcw(pad, info, user_data):
-    """
-    1. Convert GStreamer buffer to Numpy RGB
-    2. Run lane detection using UFLD
-    3. Draw lane lines on a debug overlay
-    4. Extract Hailo detection results from the buffer
-    5. Identify front vehicle within the detected lane
-    6. Track the front vehilce and annotate
-    7. Show final debug frame in user_data.set_frame()
-    """
-
-
+def app_callback_fcw_noinfer(pad, info, user_data):
     # -----------
     # Step 1: Extract frame data
     # -----------
@@ -297,14 +286,97 @@ def app_callback_fcw(pad, info, user_data):
 
     #Step2: Lane Detection using UFLD
     # -----------
-    # Resize frame for inference input
-    frame_resized = cv2.resize(frame_bgr, (1280, 720), interpolation=cv2.INTER_LINEAR)
 
-    # Run inference on resized_frame to get model_output
-    # model_output = your_lane_detection_inference(frame_resized)  # Replace this with your actual inference function
+    # lane_points = ufld_processing.get_coordinates(frame_resized) # Run inference
+    lane_points = None
+    if lane_points:
+        for lane in lane_points:
+            points = np.array(lane, np.int32)
+            cv2.polylines(debug_frame, [points], False, (0, 255, 0), 2)
+    # Define and Draw Danger zones
+    danger_zone_polygon = define_danger_zone(debug_frame)
+    cv2.polylines(debug_frame, [danger_zone_polygon], True, (255,0,0), 2)
+    # -----------
+    # Step 3: Get Hailo Detections
+    # -----------
+     # Vehicle detection (simplified)
+    roi = hailo.get_roi_from_buffer(buffer)
+    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+    for det in detections:
+        if det.get_label() in ["car", "truck"] and det.get_confidence() >= 0.6:
+            bbox = det.get_bbox()
+            centroid_x = int((bbox.xmin() + bbox.xmax()) / 2 * debug_frame.shape[1])
+            centroid_y = int((bbox.ymin() + bbox.ymax()) / 2 * debug_frame.shape[0])
 
-    lane_points = ufld_processing.get_coordinates(frame_resized) # Run inference
+            # Draw centroid
+            cv2.circle(debug_frame, (centroid_x, centroid_y), 5, (0, 0, 255), -1)
 
+            # FCW alert if centroid is in danger zone
+            if is_inside_polygon((centroid_x, centroid_y), define_danger_zone(debug_frame)):
+                cv2.putText(debug_frame, "FCW ALERT!", (50, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+            # user_data.visualize(speed) #record time, speed in separate csv file
+        
+
+    # -----------
+    # Step 6: Send the debug_frame to the display
+    # -----------
+    if user_data.use_frame:
+        user_data.set_frame(debug_frame)
+
+    return Gst.PadProbeReturn.OK
+
+# already handles reading from the camera or video source. applying the Hailo pipeline and calling thsi for each frame.
+def app_callback_fcw(pad, info, user_data):
+    """
+    1. Convert GStreamer buffer to Numpy RGB
+    2. Run lane detection using UFLD
+    3. Draw lane lines on a debug overlay
+    4. Extract Hailo detection results from the buffer
+    5. Identify front vehicle within the detected lane
+    6. Track the front vehilce and annotate
+    7. Show final debug frame in user_data.set_frame()
+
+    I want to draw danger zone with lane detections. I want danger zone in front of the car.
+    1. prototype current version: static danger zone; current fcw.py code
+    2. moving danger zone based on the speed of current vehicle and front vehicle speed and 
+    distance based on lucas-kanade method.
+
+    one red dot in the iou zone? will be focused, in the case of lane change from other lane, 
+    up to 4 interested cars will be exist. the clostest car's red dot is extremly closer 
+    to the bottom center of it's bounding box, it alerts FCW and slow!c
+
+    1. should i implement 1-a: danger zone red dot tracking method 
+                          1-b: lane detection method -> to filter out cars in adjacent lanes
+                          question: I have current speed of the ego vehicle how can i use that to enhance fcw? now too much false positives and false negatives
+                          Testing: compare results for 2-a and 2-b
+                          2-a: TTC approach with current vehicle speed - lucas-kanade 
+                          2-b: TTC approach with current vehicle speed - relative speed from the log file
+    """
+    # -----------
+    # Step 1: Extract frame data
+    # -----------
+    buffer = info.get_buffer()
+    if not buffer:
+        return Gst.PadProbeReturn.OK
+
+    user_data.increment()
+    format, width, height = get_caps_from_pad(pad)
+    frame_rgb = get_numpy_from_buffer(buffer, format, width, height)
+    if frame_rgb is None:
+        return Gst.PadProbeReturn.OK
+
+    # Convert to BGR for normal OpenCV usage
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    debug_frame = frame_bgr.copy()
+    print(f"UFLD expected input size: {ufld_processing.get_original_frame_size()}")
+    print(f"Current frame size: {frame_bgr.shape}")
+
+    #Step2: Lane Detection using UFLD to filter out adjacent lane vehicles
+    # -----------
+
+    # lane_points = ufld_processing.get_coordinates(frame_resized) # Run inference
+    lane_points = None
     if lane_points:
         for lane in lane_points:
             points = np.array(lane, np.int32)
