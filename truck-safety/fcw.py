@@ -7,7 +7,6 @@ import numpy as np
 import cv2
 import hailo, sys, time, queue,threading
 import matplotlib
-matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 # Adjust path to the new location of hailo-apps-infra
 # sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hailo-apps-infra")))
@@ -30,10 +29,13 @@ lane_output_q = queue.Queue(maxsize=3)
 #load HailoAsyncInference for lane detction
 HEF_PATH = "/home/jung/Desktop/hailo-rpi5-examples/truck-safety/resources/yolov10s.hef"
 # lane_inference = HailoAsyncInference(hef_path='/home/jung/Desktop/hailo-rpi5-examples/truck-safety/resources/yolov10s.hef', input_queue=lane_input_q, output_queue=lane_output_q,batch_size=1)
+t_file = "/home/jung/Desktop/hailo-rpi5-examples/truck-safety/resources/15/processed_log/CAN/speed/t"
+value_file = "/home/jung/Desktop/hailo-rpi5-examples/truck-safety/resources/15/processed_log/CAN/speed/value"
+
 #Run inference in a separate thread
 def start_lane_inference():
     lane_inference.run()
-threading.Thread(target=start_lane_inference, daemon=True).start()
+# threading.Thread(target=start_lane_inference, daemon=True).start()
 
 from lane_detection_utils import UFLDProcessing
 # ---------
@@ -209,7 +211,7 @@ def detect_lane_mask(frame_bgr):
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            cv2.line(line_img, (x1, y1), (x2, y2), (255, 255, 255), 2)
+            cv2.line(line_img, (x1, y1), (x2, y2), (144, 238, 144), 2)
 
     # Convert to a lane_mask
     line_gray = cv2.cvtColor(line_img, cv2.COLOR_BGR2GRAY)
@@ -250,70 +252,126 @@ def point_in_polygon(cx, cy, polygon):
     dist = cv2.pointPolygonTest(polygon, (cx, cy), False)
     # dist >= 0 => inside or on the boundary
     return (dist >= 0)
-def define_danger_zone(frame):
-    h, w = frame.shape[:2]
-    polygon = np.array([
-        [int(0.45 * w), int(h * 0.55)],
-        [int(0.55* w), int(h * 0.55)],
-        [int(0.8 * w), h],
-        [int(0.2 * w), h],
-    ], np.int32)
-    return polygon
+
 def is_inside_polygon(point, polygon):
     return cv2.pointPolygonTest(polygon, point, False) >= 0
-def detect_lane_masks(roi, width, height):
+t_data = np.load(t_file)
+value_data = np.load(value_file).flatten()
+
+t_data_normalized = t_data - t_data[0]
+start_time = time.time()
+def get_current_speed():
     """
-    Extract lane segmentation masks from Hailo's inference.
-
-    Args:
-        roi: Hailo Region of Interest (ROI) containing detected objects.
-        width (int): Frame width.
-        height (int): Frame height.
-
-    Returns:
-        lane_mask (np.array): A binary mask of lane areas.
+    Interpolates the current vehicle speed from CAN data (m/s) and converts it to mph.
     """
-    lane_mask = np.zeros((height, width), dtype=np.uint8)
+    try:
+        current_elapsed_time = time.time() - start_time  # Elapsed time since program started
 
-    # Get instance segmentation results
-    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
-    for detection in detections:
-        label = detection.get_label()
-        bbox = detection.get_bbox()
-        confidence = detection.get_confidence()
+        # Interpolate speed using normalized timestamps
+        speed_mps = np.interp(current_elapsed_time, t_data_normalized, value_data)
 
-        # Assuming lanes are labeled as "lane" or similar in the model
-        if label in ["lane", "road_marking", "lane_boundary"] and confidence >= 0.6:
-            masks = detection.get_objects_typed(hailo.HAILO_CONF_CLASS_MASK)
-            if len(masks) != 0:
-                mask = masks[0]
+        # Convert to mph
+        speed_mph = speed_mps * 2.23694
 
-                # Reshape the mask into its original dimensions
-                mask_height, mask_width = mask.get_height(), mask.get_width()
-                data = np.array(mask.get_data()).reshape((mask_height, mask_width))
+        print(f"[DEBUG] Current Speed: {speed_mps:.5f} m/s -> {speed_mph:.2f} mph")
 
-                # Resize mask to the bounding box size
-                roi_width = int(bbox.width() * width)
-                roi_height = int(bbox.height() * height)
-                resized_mask = cv2.resize(data, (roi_width, roi_height), interpolation=cv2.INTER_LINEAR)
+        return speed_mph
+    except Exception as e:
+        print(f"[ERROR] Unable to load speed data: {e}")
+        return 0.0
+# -----------------------
+# Define Danger Zone Function
+# -----------------------
+def define_danger_zone(frame):
+    """Defines an **IOU-focused static danger zone**, ensuring only center lane detections."""
+    h, w = frame.shape[:2]
+    polygon = np.array([
+        [int(0.01 * w), h],  # Wider bottom left
+        [int(0.40 * w), int(0.55 * h)],  # Left lane boundary
+        [int(0.60 * w), int(0.55 * h)],  # Right lane boundary
+        [int(0.99 * w), h],  # Wider bottom right
+    ], np.int32)
+    return polygon
 
-                # Calculate the ROI coordinates
-                x_min, y_min = int(bbox.xmin() * width), int(bbox.ymin() * height)
-                x_max, y_max = x_min + roi_width, y_min + roi_height
+# -----------------------
+# Lane Detection Function
+# -----------------------
+def detect_lane_mask(frame_bgr, danger_zone_polygon):
+    """Optimized lane detection inside the given danger zone (IOU region) with merged lane lines."""
+    h, w = frame_bgr.shape[:2]
 
-                # Ensure dimensions are within valid range
-                y_min, x_min = max(y_min, 0), max(x_min, 0)
-                y_max, x_max = min(y_max, height), min(x_max, width)
+    # Convert to grayscale **before applying ROI mask** (less computation)
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
-                # Apply mask overlay
-                if x_max > x_min and y_max > y_min:
-                    lane_mask[y_min:y_max, x_min:x_max] = (resized_mask[:y_max - y_min, :x_max - x_min] > 0.5) * 255
+    # **Apply Gaussian Blur (Reduces noise)**
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Create a mask for the danger zone
+    mask = np.zeros_like(gray)
+    cv2.fillPoly(mask, [danger_zone_polygon], 255)
+
+    # **Apply the danger zone mask directly**
+    roi = cv2.bitwise_and(gray, mask)
+
+    # **Adaptive Canny Edge Detection (Dynamically Adjusted)**
+    low_thresh, high_thresh = 100, 200  # Reduce the range
+    edges = cv2.Canny(roi, low_thresh, high_thresh)
+
+    # **Merge broken lane lines using Morphological Closing**
+    kernel = np.ones((5, 5), np.uint8)  # Larger kernel (helps merge close lines)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # **Optimize HoughLinesP Parameters to prevent splitting lanes**
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=80, maxLineGap=15)
+
+    # Convert detected lines into a lane mask
+    lane_mask = np.zeros_like(gray)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(lane_mask, (x1, y1), (x2, y2), 255, 3)  # Thicker lane lines
 
     return lane_mask
 
+
+# -----------------------
+# Compute IOU Function
+# -----------------------
+def compute_iou(bbox, lane_mask, frame_width, frame_height):
+    """Computes IOU between a bounding box and the lane mask."""
+    x1, y1 = int(bbox.xmin() * frame_width), int(bbox.ymin() * frame_height)
+    x2, y2 = int(bbox.xmax() * frame_width), int(bbox.ymax() * frame_height)
+
+    # Create a blank mask for the vehicle bounding box
+    vehicle_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+    cv2.rectangle(vehicle_mask, (x1, y1), (x2, y2), 255, thickness=-1)
+
+    # Compute intersection and union areas
+    intersection = cv2.bitwise_and(vehicle_mask, lane_mask)
+    intersection_area = np.count_nonzero(intersection)
+    vehicle_area = np.count_nonzero(vehicle_mask)
+
+    # Compute IOU
+    iou = intersection_area / vehicle_area if vehicle_area > 0 else 0
+    return iou
+def update_danger_zone(frame, bottom_edge_y):
+    """Updates the dynamic danger zone height based on the bottom edge of the front vehicle."""
+    h, w = frame.shape[:2]
+    dynamic_height = int(bottom_edge_y) if bottom_edge_y else int(0.55 * h)
+    polygon = np.array([
+        [int(0.01 * w), h],
+        [int(0.40 * w), dynamic_height],
+        [int(0.60 * w), dynamic_height],
+        [int(0.99 * w), h],
+    ], np.int32)
+    return polygon
 # Predefined colors (BGR format)
 LIGHT_GREEN = (144, 238, 144)  # Light Green for lane regions
-DARK_GREEN = (0, 100, 0)  # Dark Green for detected lane edges
+DARK_GREEN = (0, 255, 0)  # Dark Green for detected lane edges
+danger_zone_queue = queue.Queue(maxsize=2)
+last_update_time = time.time()
+frame_counter=0
+
 # already handles reading from the camera or video source. applying the Hailo pipeline and calling thsi for each frame.
 def app_callback_fcw(pad, info, user_data):
     """
@@ -367,7 +425,7 @@ def app_callback_fcw(pad, info, user_data):
     if lane_points:
         for lane in lane_points:
             points = np.array(lane, np.int32)
-            cv2.polylines(debug_frame, [points], False, (0, 255, 0), 2)
+            cv2.polylines(debug_frame, [points], False, (0, 0, 255), 2)
     # Define and Draw Danger zones
     danger_zone_polygon = define_danger_zone(debug_frame)
     cv2.polylines(debug_frame, [danger_zone_polygon], True, (255,0,0), 2)
@@ -401,6 +459,15 @@ def app_callback_fcw(pad, info, user_data):
 
     return Gst.PadProbeReturn.OK
 def app_callback_fcw2(pad, info, user_data):
+    """
+    1. Select the front vehicle based on the closest orthogonal distance to the center vertical lane.
+    2. Always display the bounding box of the front vehicle.
+    3. FCW alert triggers when the front vehicle enters the danger zone.
+    4. Overlay the center vertical lane for reference.
+    5. Print detected front vehicle details to the command line.
+    """
+
+    # Extract Frame Data
     buffer = info.get_buffer()
     if not buffer:
         return Gst.PadProbeReturn.OK
@@ -414,91 +481,96 @@ def app_callback_fcw2(pad, info, user_data):
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     debug_frame = frame_bgr.copy()
 
-    # Step 1: Push frame into lane detection inference queue
-    if not lane_input_queue.full():
-        lane_input_queue.put(frame_bgr)
+    # Draw a Vertical Center Lane Reference Line
+    center_x = width // 2
+    # cv2.line(debug_frame, (center_x, 0), (center_x, height), (255, 255, 0), 2)  # Light Blue Line
 
-    # Step 2: Retrieve lane detection results if available
-    lane_mask = np.zeros((height, width), dtype=np.uint8)
-    try:
-        _, lane_output = lane_output_queue.get_nowait()
-        lane_mask = lane_output  # Assuming output is a lane segmentation mask
-    except queue.Empty:
-        pass  # Use the empty lane mask if no result is available
+    # Step 3: Get Danger Zone Polygon (For IOU Region)
+    danger_zone_polygon = np.array([
+        [int(0.01 * width), height],  # Wider bottom left
+        [int(0.40 * width), int(0.55 * height)],  # Left lane boundary
+        [int(0.60 * width), int(0.55 * height)],  # Right lane boundary
+        [int(0.99 * width), height],  # Wider bottom right
+    ], np.int32)
 
-    # Step 3: Overlay detected lane markings
+    cv2.polylines(debug_frame, [danger_zone_polygon], True, (0, 255, 0), 2)  # Green outline
+
+    # Detect Lane Mask Only Inside the IOU Region
+    lane_mask = detect_lane_mask(debug_frame, danger_zone_polygon)
     lane_overlay = np.zeros_like(frame_bgr)
-    lane_overlay[lane_mask > 0] = (144, 238, 144)  # Light Green for lane areas
-    edges = cv2.Canny(lane_mask, 50, 150)
-    lane_overlay[edges > 0] = (0, 100, 0)  # Dark Green for lane edges
+    lane_overlay[lane_mask > 0] = DARK_GREEN  # Highlight detected lane
     debug_frame = cv2.addWeighted(debug_frame, 0.7, lane_overlay, 0.3, 0)
 
-    # Step 4: Detect Vehicles using Hailo
+    # Get Hailo Detections
     roi = hailo.get_roi_from_buffer(buffer)
     detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
 
-    min_y = float('inf')
-    front_vehicle_centroid = None
-    front_vehicle_detection = None
+    # Select Front Vehicle Based on **Shortest Orthogonal Distance** to the Center Lane
+    # Select the Best Front Vehicle
+    center_x = width // 2  # Vertical center of the frame
+    min_orthogonal_distance = float('inf')
+    min_y_bottom_distance = float('inf')
+    front_vehicle = None
+    front_vehicle_bbox = None
 
     for detection in detections:
         label = detection.get_label()
         bbox = detection.get_bbox()
         confidence = detection.get_confidence()
 
-        if bbox is not None and label in ["car", "truck"] and confidence >= 0.6:
+        if bbox and label in ["car", "truck"] and confidence >= 0.65:
             x1, y1 = int(bbox.xmin() * width), int(bbox.ymin() * height)
             x2, y2 = int(bbox.xmax() * width), int(bbox.ymax() * height)
-            centroid_x, centroid_y = (x1 + x2) // 2, (y1 + y2) // 2
+            centroid_x = (x1 + x2) // 2
+            centroid_y = (y1 + y2) // 2  # Center of bounding box
 
-            # Filter out vehicles outside the ego lane
-            if lane_mask[centroid_y, centroid_x] == 0:
-                continue  # Skip vehicles outside the lane
+            # Compute orthogonal distance to center lane
+            orthogonal_distance = abs(centroid_x - center_x)
+            bottom_distance = height - y2  # Distance to bottom of frame (ego vehicle reference)
 
-            # Identify the closest front vehicle
-            if y1 < min_y:
-                min_y = y1
-                front_vehicle_centroid = (centroid_x, centroid_y)
-                front_vehicle_detection = detection
+            # Pick the closest vehicle based on **center alignment & bottom proximity**
+            if (
+                orthogonal_distance < min_orthogonal_distance or
+                (orthogonal_distance == min_orthogonal_distance and bottom_distance < min_y_bottom_distance)
+            ):
+                min_orthogonal_distance = orthogonal_distance
+                min_y_bottom_distance = bottom_distance
+                front_vehicle = detection
+                front_vehicle_bbox = (x1, y1, x2, y2)
 
-    # Draw Bounding Box for the Selected Front Vehicle
-    if front_vehicle_detection:
-        bbox = front_vehicle_detection.get_bbox()
-        x1, y1 = int(bbox.xmin() * width), int(bbox.ymin() * height)
-        x2, y2 = int(bbox.xmax() * width), int(bbox.ymax() * height)
-        cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+    # Always Show Front Vehicle Bounding Box**
+    if front_vehicle:
+        x1, y1, x2, y2 = front_vehicle_bbox
+        centroid_x, centroid_y = (x1 + x2) // 2, (y1 + y2) // 2
+
+        # **Always draw the bounding box**
+        cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 1)  # Green box
         cv2.putText(debug_frame, "Front Vehicle", (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    # Ensure front_vehicle_centroid is valid before initializing tracker
-    if front_vehicle_centroid is not None:
-        tracker.initialize(frame_bgr, [front_vehicle_centroid])
-    else:
-        print("[WARNING] No valid front vehicle detected for tracking.")
+        # Print front vehicle details to the command line**
+        # print(f"[DEBUG] Bounding Box: ({x1}, {y1}) -> ({x2}, {y2}), Center: ({centroid_x}, {centroid_y})")
+        # print(f"[DEBUG] Orthogonal Distance to Center Lane: {min_distance}px")
 
-    # Perform Tracking if Tracker is Initialized
-    if tracker.prev_pts is not None and len(tracker.prev_pts) > 0:
-        frame_bgr, speed, acceleration = tracker.track(frame_bgr)
-        cv2.putText(debug_frame, f"Speed: {speed:.2f} px/s", (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(debug_frame, f"Acc: {acceleration:.2f} px/s^2", (50, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        if acceleration < DANGER_ACCELERATION_THRESHOLD:
-            cv2.putText(debug_frame, "FCW ALERT!", (50, 120),
+        # Trigger FCW Alert Only if the vehicle enters the danger zone**
+        if cv2.pointPolygonTest(danger_zone_polygon, (centroid_x, centroid_y), False) >= 0:
+            cv2.putText(debug_frame, "!!! SLOW !!!️", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-
+    # Overlay Current Vehicle Speed
+    current_speed = get_current_speed()  # Get interpolated speed
+    speed_text = f"Speed: {current_speed:.0f} mph"
+    # print(f"current speed: {speed_text}")
+    cv2.putText(debug_frame, speed_text, (50, height - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    # Display Debug Frame
     if user_data.use_frame:
         user_data.set_frame(debug_frame)
 
     return Gst.PadProbeReturn.OK
 
 
-
-
 if __name__ == "__main__":
     # Create an instance of the user app callback class
     user_data = user_app_callback_class()
     user_data.use_frame = True
-    app = GStreamerDetectionApp(app_callback_fcw, user_data)
+    app = GStreamerDetectionApp(app_callback_fcw2, user_data)
     app.run()
